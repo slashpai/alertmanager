@@ -19,6 +19,7 @@ import (
 	"io/ioutil"
 	"os"
 	"sort"
+	"sync"
 	"testing"
 	"time"
 
@@ -179,6 +180,51 @@ func TestSilencesSnapshot(t *testing.T) {
 	}
 }
 
+// This tests a regression introduced by https://github.com/prometheus/alertmanager/pull/2689.
+func TestSilences_Maintenance_DefaultMaintenanceFuncDoesntCrash(t *testing.T) {
+	f, err := ioutil.TempFile("", "snapshot")
+	require.NoError(t, err, "creating temp file failed")
+	s := &Silences{st: state{}, logger: log.NewNopLogger(), now: utcNow, metrics: newMetrics(nil, nil)}
+	stopc := make(chan struct{})
+
+	done := make(chan struct{})
+	go func() {
+		s.Maintenance(100*time.Millisecond, f.Name(), stopc, nil)
+		close(done)
+	}()
+
+	time.Sleep(200 * time.Millisecond)
+	close(stopc)
+
+	<-done
+}
+
+func TestSilences_Maintenance_SupportsCustomCallback(t *testing.T) {
+	f, err := ioutil.TempFile("", "snapshot")
+	require.NoError(t, err, "creating temp file failed")
+	s := &Silences{st: state{}, logger: log.NewNopLogger(), now: utcNow, metrics: newMetrics(nil, nil)}
+	stopc := make(chan struct{})
+	var mtx sync.Mutex
+	var mc int
+
+	go s.Maintenance(100*time.Millisecond, f.Name(), stopc, func() (int64, error) {
+		mtx.Lock()
+		mc++
+		mtx.Unlock()
+
+		return 0, nil
+	})
+
+	time.Sleep(200 * time.Millisecond)
+	close(stopc)
+
+	require.Eventually(t, func() bool {
+		mtx.Lock()
+		defer mtx.Unlock()
+		return mc >= 2 // At least, one for the regular schedule and one at shutdown.
+	}, 500*time.Millisecond, 100*time.Millisecond)
+}
+
 func TestSilencesSetSilence(t *testing.T) {
 	s, err := New(Options{
 		Retention: time.Minute,
@@ -316,7 +362,6 @@ func TestSilenceSet(t *testing.T) {
 		},
 	}
 	require.Equal(t, want, s.st, "unexpected state after silence creation")
-
 	// Update silence 2 with new matcher expires it and creates a new one.
 	now = now.Add(time.Minute)
 	now4 := now
@@ -378,6 +423,55 @@ func TestSilenceSet(t *testing.T) {
 				UpdatedAt: now5,
 			},
 			ExpiresAt: now5.Add(5*time.Minute + s.retention),
+		},
+	}
+	require.Equal(t, want, s.st, "unexpected state after silence creation")
+}
+
+func TestSetActiveSilence(t *testing.T) {
+	s, err := New(Options{
+		Retention: time.Hour,
+	})
+	require.NoError(t, err)
+
+	now := utcNow()
+	s.now = func() time.Time { return now }
+
+	startsAt := now.Add(-1 * time.Minute)
+	endsAt := now.Add(5 * time.Minute)
+	// Insert silence with fixed start time.
+	sil1 := &pb.Silence{
+		Matchers: []*pb.Matcher{{Name: "a", Pattern: "b"}},
+		StartsAt: startsAt,
+		EndsAt:   endsAt,
+	}
+	id1, _ := s.Set(sil1)
+
+	// Update silence with 2 extra nanoseconds so the "seconds" part should not change
+
+	newStartsAt := now.Add(2 * time.Nanosecond)
+	newEndsAt := endsAt.Add(2 * time.Minute)
+
+	sil2 := cloneSilence(sil1)
+	sil2.Id = id1
+	sil2.StartsAt = newStartsAt
+	sil2.EndsAt = newEndsAt
+
+	now = now.Add(time.Minute)
+	id2, err := s.Set(sil2)
+	require.NoError(t, err)
+	require.Equal(t, id1, id2)
+
+	want := state{
+		id2: &pb.MeshSilence{
+			Silence: &pb.Silence{
+				Id:        id1,
+				Matchers:  []*pb.Matcher{{Name: "a", Pattern: "b"}},
+				StartsAt:  newStartsAt,
+				EndsAt:    newEndsAt,
+				UpdatedAt: now,
+			},
+			ExpiresAt: newEndsAt.Add(s.retention),
 		},
 	}
 	require.Equal(t, want, s.st, "unexpected state after silence creation")
@@ -789,9 +883,7 @@ func TestSilenceExpire(t *testing.T) {
 	require.NoError(t, s.Expire("pending"))
 	require.NoError(t, s.Expire("active"))
 
-	err = s.Expire("expired")
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "already expired")
+	require.NoError(t, s.Expire("expired"))
 
 	sil, err := s.QueryOne(QIDs("pending"))
 	require.NoError(t, err)
@@ -889,9 +981,7 @@ func TestSilenceExpireWithZeroRetention(t *testing.T) {
 	require.NoError(t, s.Expire("pending"))
 	require.NoError(t, s.Expire("active"))
 
-	err = s.Expire("expired")
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "already expired")
+	require.NoError(t, s.Expire("expired"))
 
 	_, err = s.QueryOne(QIDs("pending"))
 	require.NoError(t, err)
@@ -1045,7 +1135,7 @@ func TestValidateMatcher(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		checkErr(t, c.err, validateMatcher(c.m))
+		checkErr(t, c.err, ValidateMatcher(c.m))
 	}
 }
 
