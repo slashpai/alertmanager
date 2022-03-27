@@ -55,6 +55,7 @@ import (
 	"github.com/prometheus/alertmanager/notify/pushover"
 	"github.com/prometheus/alertmanager/notify/slack"
 	"github.com/prometheus/alertmanager/notify/sns"
+	"github.com/prometheus/alertmanager/notify/telegram"
 	"github.com/prometheus/alertmanager/notify/victorops"
 	"github.com/prometheus/alertmanager/notify/webhook"
 	"github.com/prometheus/alertmanager/notify/wechat"
@@ -169,6 +170,9 @@ func buildReceiverIntegrations(nc *config.Receiver, tmpl *template.Template, log
 	for i, c := range nc.SNSConfigs {
 		add("sns", i, c, func(l log.Logger) (notify.Notifier, error) { return sns.New(c, tmpl, l) })
 	}
+	for i, c := range nc.TelegramConfigs {
+		add("telegram", i, c, func(l log.Logger) (notify.Notifier, error) { return telegram.New(c, tmpl, l) })
+	}
 	if errs.Len() > 0 {
 		return nil, &errs
 	}
@@ -200,17 +204,19 @@ func run() int {
 
 		clusterBindAddr = kingpin.Flag("cluster.listen-address", "Listen address for cluster. Set to empty string to disable HA mode.").
 				Default(defaultClusterAddr).String()
-		clusterAdvertiseAddr = kingpin.Flag("cluster.advertise-address", "Explicit address to advertise in cluster.").String()
-		peers                = kingpin.Flag("cluster.peer", "Initial peers (may be repeated).").Strings()
-		peerTimeout          = kingpin.Flag("cluster.peer-timeout", "Time to wait between peers to send notifications.").Default("15s").Duration()
-		gossipInterval       = kingpin.Flag("cluster.gossip-interval", "Interval between sending gossip messages. By lowering this value (more frequent) gossip messages are propagated across the cluster more quickly at the expense of increased bandwidth.").Default(cluster.DefaultGossipInterval.String()).Duration()
-		pushPullInterval     = kingpin.Flag("cluster.pushpull-interval", "Interval for gossip state syncs. Setting this interval lower (more frequent) will increase convergence speeds across larger clusters at the expense of increased bandwidth usage.").Default(cluster.DefaultPushPullInterval.String()).Duration()
-		tcpTimeout           = kingpin.Flag("cluster.tcp-timeout", "Timeout for establishing a stream connection with a remote node for a full state sync, and for stream read and write operations.").Default(cluster.DefaultTcpTimeout.String()).Duration()
-		probeTimeout         = kingpin.Flag("cluster.probe-timeout", "Timeout to wait for an ack from a probed node before assuming it is unhealthy. This should be set to 99-percentile of RTT (round-trip time) on your network.").Default(cluster.DefaultProbeTimeout.String()).Duration()
-		probeInterval        = kingpin.Flag("cluster.probe-interval", "Interval between random node probes. Setting this lower (more frequent) will cause the cluster to detect failed nodes more quickly at the expense of increased bandwidth usage.").Default(cluster.DefaultProbeInterval.String()).Duration()
-		settleTimeout        = kingpin.Flag("cluster.settle-timeout", "Maximum time to wait for cluster connections to settle before evaluating notifications.").Default(cluster.DefaultPushPullInterval.String()).Duration()
-		reconnectInterval    = kingpin.Flag("cluster.reconnect-interval", "Interval between attempting to reconnect to lost peers.").Default(cluster.DefaultReconnectInterval.String()).Duration()
-		peerReconnectTimeout = kingpin.Flag("cluster.reconnect-timeout", "Length of time to attempt to reconnect to a lost peer.").Default(cluster.DefaultReconnectTimeout.String()).Duration()
+		clusterAdvertiseAddr   = kingpin.Flag("cluster.advertise-address", "Explicit address to advertise in cluster.").String()
+		peers                  = kingpin.Flag("cluster.peer", "Initial peers (may be repeated).").Strings()
+		peerTimeout            = kingpin.Flag("cluster.peer-timeout", "Time to wait between peers to send notifications.").Default("15s").Duration()
+		gossipInterval         = kingpin.Flag("cluster.gossip-interval", "Interval between sending gossip messages. By lowering this value (more frequent) gossip messages are propagated across the cluster more quickly at the expense of increased bandwidth.").Default(cluster.DefaultGossipInterval.String()).Duration()
+		pushPullInterval       = kingpin.Flag("cluster.pushpull-interval", "Interval for gossip state syncs. Setting this interval lower (more frequent) will increase convergence speeds across larger clusters at the expense of increased bandwidth usage.").Default(cluster.DefaultPushPullInterval.String()).Duration()
+		tcpTimeout             = kingpin.Flag("cluster.tcp-timeout", "Timeout for establishing a stream connection with a remote node for a full state sync, and for stream read and write operations.").Default(cluster.DefaultTcpTimeout.String()).Duration()
+		probeTimeout           = kingpin.Flag("cluster.probe-timeout", "Timeout to wait for an ack from a probed node before assuming it is unhealthy. This should be set to 99-percentile of RTT (round-trip time) on your network.").Default(cluster.DefaultProbeTimeout.String()).Duration()
+		probeInterval          = kingpin.Flag("cluster.probe-interval", "Interval between random node probes. Setting this lower (more frequent) will cause the cluster to detect failed nodes more quickly at the expense of increased bandwidth usage.").Default(cluster.DefaultProbeInterval.String()).Duration()
+		settleTimeout          = kingpin.Flag("cluster.settle-timeout", "Maximum time to wait for cluster connections to settle before evaluating notifications.").Default(cluster.DefaultPushPullInterval.String()).Duration()
+		reconnectInterval      = kingpin.Flag("cluster.reconnect-interval", "Interval between attempting to reconnect to lost peers.").Default(cluster.DefaultReconnectInterval.String()).Duration()
+		peerReconnectTimeout   = kingpin.Flag("cluster.reconnect-timeout", "Length of time to attempt to reconnect to a lost peer.").Default(cluster.DefaultReconnectTimeout.String()).Duration()
+		tlsConfigFile          = kingpin.Flag("cluster.tls-config", "[EXPERIMENTAL] Path to config yaml file that can enable mutual TLS within the gossip protocol.").Default("").String()
+		allowInsecureAdvertise = kingpin.Flag("cluster.allow-insecure-public-advertise-address-discovery", "[EXPERIMENTAL] Allow alertmanager to discover and listen on a public IP address.").Bool()
 	)
 
 	promlogflag.AddFlags(kingpin.CommandLine, &promlogConfig)
@@ -231,6 +237,11 @@ func run() int {
 		return 1
 	}
 
+	tlsTransportConfig, err := cluster.GetTLSTransportConfig(*tlsConfigFile)
+	if err != nil {
+		level.Error(logger).Log("msg", "unable to initialize TLS transport configuration for gossip mesh", "err", err)
+		return 1
+	}
 	var peer *cluster.Peer
 	if *clusterBindAddr != "" {
 		peer, err = cluster.Create(
@@ -245,6 +256,8 @@ func run() int {
 			*tcpTimeout,
 			*probeTimeout,
 			*probeInterval,
+			tlsTransportConfig,
+			*allowInsecureAdvertise,
 		)
 		if err != nil {
 			level.Error(logger).Log("msg", "unable to initialize gossip mesh", "err", err)
@@ -260,7 +273,7 @@ func run() int {
 	notificationLogOpts := []nflog.Option{
 		nflog.WithRetention(*retention),
 		nflog.WithSnapshot(filepath.Join(*dataDir, "nflog")),
-		nflog.WithMaintenance(15*time.Minute, stopc, wg.Done),
+		nflog.WithMaintenance(15*time.Minute, stopc, wg.Done, nil),
 		nflog.WithMetrics(prometheus.DefaultRegisterer),
 		nflog.WithLogger(log.With(logger, "component", "nflog")),
 	}
@@ -297,7 +310,7 @@ func run() int {
 	// Start providers before router potentially sends updates.
 	wg.Add(1)
 	go func() {
-		silences.Maintenance(15*time.Minute, filepath.Join(*dataDir, "silences"), stopc)
+		silences.Maintenance(15*time.Minute, filepath.Join(*dataDir, "silences"), stopc, nil)
 		wg.Done()
 	}()
 
@@ -427,10 +440,14 @@ func run() int {
 			integrationsNum += len(integrations)
 		}
 
-		// Build the map of time interval names to mute time definitions.
-		muteTimes := make(map[string][]timeinterval.TimeInterval, len(conf.MuteTimeIntervals))
+		// Build the map of time interval names to time interval definitions.
+		timeIntervals := make(map[string][]timeinterval.TimeInterval, len(conf.MuteTimeIntervals)+len(conf.TimeIntervals))
 		for _, ti := range conf.MuteTimeIntervals {
-			muteTimes[ti.Name] = ti.TimeIntervals
+			timeIntervals[ti.Name] = ti.TimeIntervals
+		}
+
+		for _, ti := range conf.TimeIntervals {
+			timeIntervals[ti.Name] = ti.TimeIntervals
 		}
 
 		inhibitor.Stop()
@@ -452,7 +469,7 @@ func run() int {
 			waitFunc,
 			inhibitor,
 			silencer,
-			muteTimes,
+			timeIntervals,
 			notificationLog,
 			pipelinePeer,
 		)
